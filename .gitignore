@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+snap_resources.json
+state.json
+state.json.tmp
+state.json.enc.tmp
