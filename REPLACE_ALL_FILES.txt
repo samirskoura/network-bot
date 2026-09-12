@@ -1,0 +1,72 @@
+REPLACE ALL OLD BOT FILES - KEEP YOUR SECRETS
+
+This full package is for the SAME existing GitHub repository and Ad Account.
+No manual copying or editing of old source files is required.
+
+1. Let the current bot job finish, disable the old workflow, and cancel queued
+   runs so they cannot start during installation.
+
+2. Keep the repository, its Git commit history and all your existing Secrets,
+   especially STATE_ENCRYPTION_KEY. Do not delete/recreate the repository.
+
+3. Download this ZIP again and extract it on your computer.
+
+4. Delete all old repository files and old workflow files. Commit the deletions
+   normally in the same repository. You can delete state.json.enc too: its
+   previously committed version will be recovered automatically.
+
+5. Upload ALL files and folders from inside the extracted ZIP to the repository
+   root. Upload the extracted contents, not the ZIP or an extra enclosing folder.
+   Commit the upload.
+
+6. Confirm these exact paths exist:
+   snap_headline_bot.py
+   state_crypto.py
+   restore_encrypted_state.py
+   requirements.txt
+   headline_pool.txt
+   blocked_headline_hashes.txt
+   .github/workflows/snapchat-headline-editor.yml
+
+   Only the supplied workflow should remain. If browser upload omitted its folder,
+   click Add file -> Create new file, enter the exact workflow path above, paste
+   the entire supplied YAML content, and commit.
+
+7. In Actions, enable the workflow if it is disabled. Its display name is:
+   Snapchat Second Ad Account Headline Monitor
+
+8. Run a manual test:
+   target_slot: target_1
+   run_mode: test
+   max_updates: 80
+   monitoring: one_check
+
+   When a previously committed state file was deleted, the log should say:
+   Encrypted state restored from repository history.
+
+   Encryption and target checks must pass. If candidates exist, the status
+   protection message and WOULD UPDATE previews also appear.
+
+9. Run one live check with max_updates=1 and monitoring=one_check. Verify the
+   intended Creative in Snapchat and that state.json.enc is saved in GitHub.
+   After success, use max_updates=60 or 80 with monitoring=overnight.
+
+Manual runs need no repository Variables. If old BOT_ENABLED=true and RUN_MODE=live
+Variables still exist, set BOT_ENABLED=false during installation. Optional
+scheduled operation is described in README.md.
+
+RECOVERY DETAILS
+The workflow downloads complete Git history. If state.json.enc is missing, it
+restores the most recent saved copy among the current branch's ancestors and
+decrypts it with your existing Secret before Snapchat access. No old code is
+restored. An unreadable or undecryptable saved file stops processing; the bot
+does not silently use older state or remove its status guards.
+
+If no state was ever committed, or its history was erased, there is nothing to
+recover. The bot reports that it is starting new history. Secrets cannot recreate
+approval records or attempts that were never saved.
+
+Replacing all files installs the supplied default headline pool and extra hash
+list. Headline history recovered from encrypted state remains active.
+
+See README.md for detailed behavior and concurrent-status limitations.
