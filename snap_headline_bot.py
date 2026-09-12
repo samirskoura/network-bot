@@ -94,7 +94,8 @@ STATE_PATH = Path(__file__).with_name("state.json")
 BLOCKED_HEADLINE_HASHES_PATH = Path(__file__).with_name("blocked_headline_hashes.txt")
 HEADLINE_POOL_PATH = Path(__file__).with_name("headline_pool.txt")
 STATE_VERSION = 9
-HARD_MAX_UPDATES_PER_RUN = 30
+HARD_MAX_UPDATES_PER_RUN = 80
+MAX_HEADLINE_REQUEST_CREATIVES = 30
 HARD_MAX_AD_SQUADS = 20
 HEADLINE_OPTIONS_PER_CREATIVE = 5
 MAX_HEADLINE_GENERATION_ROUNDS = 2
@@ -1003,6 +1004,18 @@ def generate_headlines(
     candidates: list[dict[str, Any]],
     forbidden_headlines: list[str],
 ) -> list[dict[str, Any]]:
+    # Preserve the previous request size while allowing more edits per check.
+    # The caller validates the combined results for duplicates across all batches.
+    if len(candidates) > MAX_HEADLINE_REQUEST_CREATIVES:
+        items: list[dict[str, Any]] = []
+        for start in range(0, len(candidates), MAX_HEADLINE_REQUEST_CREATIVES):
+            items.extend(generate_headlines(
+                api_key, model, product_context,
+                candidates[start:start + MAX_HEADLINE_REQUEST_CREATIVES],
+                forbidden_headlines,
+            ))
+        return items
+
     schema = {
         "type": "object",
         "properties": {
