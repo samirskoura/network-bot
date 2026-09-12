@@ -1,0 +1,45 @@
+Single-account bot: up to 80 Creative edits per check
+
+This update contains the two replacement files for the single-account bot
+previously supplied in this conversation. It has not been applied to GitHub.
+
+1. Allow the active workflow to finish before uploading the update. Disable
+   scheduled starts temporarily with BOT_ENABLED=false if needed.
+2. Replace snap_headline_bot.py in your existing GitHub repository with the file
+   of the same name in this update.
+3. Open your EXISTING workflow file in .github/workflows. If yours is named
+   samir-bot.yml, keep that filename. Replace its content with the supplied
+   snapchat-headline-editor.yml content. Do not add a second workflow.
+4. Keep your existing Secrets, Variables, headline_pool.txt,
+   blocked_headline_hashes.txt, state_crypto.py, requirements.txt and
+   state.json.enc. Keep STATE_ENCRYPTION_KEY unchanged.
+5. Run target_1, run_mode=test, max_updates=80, monitoring=one_check.
+   Confirm the log says max_updates_per_check=80 and the intended squad count.
+6. Run target_1, run_mode=live, max_updates=80, monitoring=overnight.
+   You can enter 60 instead of 80 whenever desired.
+7. Restore BOT_ENABLED=true only if you previously used scheduled starts.
+
+The limit is TOTAL across all selected Ad Squads in ONE Ad Account per check.
+It is a ceiling, not a guaranteed edit count: rejected/disapproved status,
+review waiting, shared-Creative protection and fresh-headline validation
+still determine eligibility. This is not a per-Creative attempt limit.
+
+OpenAI generation is split into requests of at most 30 Creatives; 80 candidates
+needing generation use batches of 30, 30 and 20. Combined suggestions still
+pass the existing global duplicate checks before edits.
+
+Manual input defaults to 80. Automatic scheduled starts and the Python fallback
+default remain 30; they are not automatically raised by this update.
+The monitor waits 60 seconds AFTER each completed check. Larger checks take
+longer, so checks do not start exactly every 60 seconds.
+
+If you have independently changed the bot code since the supplied version,
+merge these targeted changes instead of replacing your customized file:
+- HARD_MAX_UPDATES_PER_RUN: 30 -> 80
+- Add MAX_HEADLINE_REQUEST_CREATIVES = 30 and the batching block at the start
+  of generate_headlines, as shown in the supplied Python file.
+- In the existing workflow, change max_updates description to 1-80 and its
+  workflow_dispatch input default to 80.
+
+Validation: local simulations only; no real Snapchat edits or OpenAI requests
+were made during this update.
