@@ -152,6 +152,10 @@ jobs:
             fi
 
             rm -f state.json
+            if ! python restore_encrypted_state.py; then
+              echo "ERROR: Could not recover saved history. Stopping before Snapchat access."
+              return 1
+            fi
             if [[ -f state.json.enc ]]; then
               if ! python state_crypto.py decrypt state.json.enc state.json; then
                 rm -f state.json
@@ -160,7 +164,7 @@ jobs:
               fi
             fi
 
-            if [[ -f state.json ]]; then
+            if [[ -f state.json ]] && git ls-files --error-unmatch state.json.enc >/dev/null 2>&1; then
               LAST_SAVED_STATE_HASH="$(sha256sum state.json | awk '{print $1}')"
             fi
           }
