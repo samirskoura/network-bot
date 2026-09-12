@@ -23,9 +23,9 @@ on:
           - test
           - live
       max_updates:
-        description: "Maximum total creatives changed per check (1-30)"
+        description: "Maximum total creatives changed per check (1-80)"
         required: true
-        default: "30"
+        default: "80"
         type: string
       monitoring:
         description: "Overnight checks every 60 seconds for 5.5 hours"
