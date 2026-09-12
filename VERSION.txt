@@ -1,43 +1,31 @@
-2026.09.01-second-account-cross-org-v2
+2026.09.12-single-account-complete-80-guarded
 
-Fixes included:
-- Separate Bot 2 package for a second Ad Account with isolated credentials and state.
-- Cross-organization guide: seller-owned OAuth app authenticates the Snapchat user who
-  already has access to the partner Ad Account; the partner shares no OAuth keys.
-- Refresh-token and state-key helpers copy sensitive values directly to the Windows
-  clipboard without displaying or saving them.
-- The OAuth helper now loads every Campaign and Ad Squad in the selected Ad Account and
-  produces the exact multi-squad GitHub Secret values in the same authentication run.
-- One workflow accepts 1-20 comma-separated Ad Squad UUIDs.
-- Every selected Ad Squad is verified against the configured Ad Account.
-- Account Ads and Creatives are fetched once per monitoring check.
-- All selected squads share one safe state and global headline history.
-- Up to 30 eligible Creatives are updated per check; remaining work is deferred.
-- The overnight job checks every selected squad every 60 seconds for 5.5 hours.
-- The five-minute GitHub schedule continues the last manually saved squad list.
-- Approved and pending Ads remain protected.
-- No per-Creative attempt limit; confirmed rejections continue until approval or stop.
-- Exact, punctuation-only, and near-duplicate headlines are rejected before PATCH.
-- Manual runs require only Ad Squad IDs; parent Campaigns are automatically resolved and
-  verified against `SNAP_AD_ACCOUNT_ID`.
-- Selected Ad Squads may belong to different Campaigns inside that same Ad Account.
-- A second edit is blocked until Snapchat exposes a real post-edit PENDING review state.
-- Creatives that reach APPROVED are permanently protected by saved state.
-- Added `MAKE_SETUP.md` for Make.com target selection and workflow dispatch.
-- Full headline history is retained so unlimited retries never intentionally reuse an old headline.
-- `manual_then_openai` is the default so fresh retries continue after the manual pool is exhausted.
-- Fixed the permanent WAIT lock when a brief PENDING state occurs between workflow runs.
-- Missed-PENDING recovery requires matching submitted headline, final
-  REJECTED/DISAPPROVED statuses, and a five-minute safety delay.
-- APPROVED Creative status now independently blocks every headline edit.
-- Replaced the old generic pool with 100 concise, natural, Saudi-friendly Arabic headlines.
-- OpenAI fallback now follows the proven headline tone and avoids repetitive payment wording.
-- Campaign, Ad Squad, Ad, and Creative names are no longer sent to OpenAI.
-- Local validation blocks internal-name tokens and Latin-to-Arabic transliterations
-  before any Snapchat PATCH.
-- Public-repository mode redacts routing identifiers, internal names, and headlines from
-  workflow logs.
-- Persistent retry history is encrypted as `state.json.enc`; plaintext `state.json` is
-  never committed.
-- Encryption is verified before any Snapchat API access, so an invalid key cannot allow
-  headline edits before state persistence is known to work.
+Complete package, including all runtime files and setup helpers.
+
+- Uses the exact engine and workflow from the revised 80-Creative update.
+- Up to 80 unique eligible Creatives across 1-20 squads in ONE Ad Account.
+- Manual default 80; scheduled fallback remains 30.
+- OpenAI candidate batches of at most 30.
+- Refreshes account Ads, linked Ads and the Creative before every edit.
+- Requires all linked live Ads to be REJECTED and the Creative DISAPPROVED.
+- APPROVED, PENDING, PENDING_REVIEW, unknown statuses and outside links block edits.
+- Approval observations are retained in saved state.
+- Every Creative PATCH tests DISAPPROVED status and the exact prior headline.
+- Failed or incomplete responses stop processing; uncertain PATCH reservations remain.
+- State schema stays at version 9; encrypted file format stays SNAP-STATE-AESGCM-1.
+- Existing bot upgrades keep their state, encryption key and credentials.
+- No per-Creative retry limit; only confirmed rejections can become eligible again.
+- Encryption preflight happens before Snapchat access.
+- Logs conceal target identifiers and headline details when PUBLIC_SAFE_LOGS=true.
+
+Validation:
+- The unchanged engine passed 14 offline integration tests, including 60/80 limits,
+  status changes, shared Creatives, conditional PATCH rejection and zero-write test mode.
+- Packaged Python, YAML and workflow shell syntax checked.
+- State encryption round trip and wrong-key rejection checked locally.
+- Runtime file inventory and ZIP contents checked.
+- No live Snapchat edits or OpenAI requests during package creation.
+- Windows PowerShell helpers included from the existing package; not executed here.
+
+See README.md for concurrent-status limitations and UPGRADE_EXISTING_BOT.txt
+for installation into a repository that already contains history.

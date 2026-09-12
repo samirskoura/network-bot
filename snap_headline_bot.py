@@ -9,7 +9,9 @@ The worker is deliberately conservative:
   transition occurred while the worker was offline;
 - each Ad/Creative is handled independently, so another pending Ad does not block it;
 - it skips creatives shared with ads outside the selected ad squads;
-- it never changes a Creative connected to an approved or pending Ad;
+- it rechecks linked Ads and the Creative immediately before each edit;
+- it requires every linked Ad to be REJECTED and the Creative DISAPPROVED;
+- every PATCH tests the Creative's status and old headline before replacing it;
 - it keeps retrying confirmed rejections while the workflow remains enabled.
 """
 
@@ -620,47 +622,90 @@ class SnapClient:
 
         raise BotError(f"{label} failed after transient retries")
 
+    @staticmethod
+    def checked_entities(
+        payload: dict[str, Any], collection: str, entity_key: str, label: str
+    ) -> list[dict[str, Any]]:
+        """Never interpret a failed or incomplete response as a safe empty list."""
+        if payload.get("request_status") != "SUCCESS":
+            raise BotError(f"{label}: Snapchat did not confirm a successful request")
+        wrappers = payload.get(collection)
+        if not isinstance(wrappers, list):
+            raise BotError(f"{label}: Snapchat omitted the expected entity array")
+        entities = []
+        for wrapper in wrappers:
+            if not isinstance(wrapper, dict) or wrapper.get("sub_request_status") != "SUCCESS":
+                raise BotError(f"{label}: Snapchat returned an unsuccessful entity result")
+            entity = wrapper.get(entity_key)
+            if (
+                not isinstance(entity, dict)
+                or not isinstance(entity.get("id"), str)
+                or not entity["id"]
+            ):
+                raise BotError(f"{label}: Snapchat returned an invalid entity")
+            entities.append(entity)
+        return entities
+
     def get_all(self, path: str, collection: str, entity_key: str) -> list[dict[str, Any]]:
         url = f"{SNAP_API}{path}"
         entities: list[dict[str, Any]] = []
         seen_urls: set[str] = set()
-        while url and url not in seen_urls:
+        seen_ids: set[str] = set()
+        while url:
+            if url in seen_urls or not url.startswith(f"{SNAP_API}/"):
+                raise BotError("Safety check failed: invalid or repeated Snapchat pagination")
             seen_urls.add(url)
-            payload = self.get(url, f"Snapchat list {collection}")
-            wrappers = payload.get(collection, [])
-            if not isinstance(wrappers, list):
-                raise BotError(f"Snapchat response field {collection!r} was not an array")
-            for wrapper in wrappers:
-                if not isinstance(wrapper, dict):
-                    continue
-                entity = wrapper.get(entity_key, wrapper)
-                if isinstance(entity, dict):
-                    entities.append(entity)
-            paging = payload.get("paging") or {}
-            next_link = paging.get("next_link") if isinstance(paging, dict) else None
-            url = urljoin(url, next_link) if isinstance(next_link, str) and next_link else ""
+            label = f"Snapchat list {collection}"
+            payload = self.get(url, label)
+            for entity in self.checked_entities(payload, collection, entity_key, label):
+                if entity["id"] in seen_ids:
+                    raise BotError("Safety check failed: duplicate entity in Snapchat pagination")
+                seen_ids.add(entity["id"])
+                entities.append(entity)
+            paging = payload.get("paging")
+            if paging is None:
+                paging = {}
+            if not isinstance(paging, dict):
+                raise BotError("Safety check failed: invalid Snapchat paging information")
+            next_link = paging.get("next_link")
+            if next_link is not None and not isinstance(next_link, str):
+                raise BotError("Safety check failed: invalid Snapchat next-page link")
+            url = urljoin(url, next_link) if next_link else ""
         return entities
 
     def one(self, path: str, collection: str, entity_key: str, label: str) -> dict[str, Any]:
         payload = self.get(path, label)
-        wrappers = payload.get(collection, [])
-        if not isinstance(wrappers, list) or not wrappers:
-            raise BotError(f"{label} returned no {entity_key}")
-        wrapper = wrappers[0]
-        entity = wrapper.get(entity_key, wrapper) if isinstance(wrapper, dict) else None
-        if not isinstance(entity, dict):
-            raise BotError(f"{label} returned an invalid {entity_key}")
-        return entity
+        entities = self.checked_entities(payload, collection, entity_key, label)
+        if len(entities) != 1:
+            raise BotError(f"{label} did not return exactly one {entity_key}")
+        return entities[0]
 
-    def patch_headline(self, ad_account_id: str, creative_id: str, headline: str) -> dict[str, Any]:
+    def patch_headline(
+        self, ad_account_id: str, creative_id: str, headline: str, *, expected_headline: str
+    ) -> dict[str, Any]:
         url = f"{SNAP_API}/adaccounts/{ad_account_id}/creatives/{creative_id}"
         headers = {
             **self.headers,
             "Content-Type": "application/json-patch+json",
         }
-        body = [{"op": "replace", "path": "/headline", "value": headline}]
+        # Snapchat JSON Patch supports test. Both conditions must pass in the
+        # same request as the edit. Never retry without these conditions.
+        body = [
+            {"op": "test", "path": "/review_status", "value": "DISAPPROVED"},
+            {"op": "test", "path": "/headline", "value": expected_headline},
+            {"op": "replace", "path": "/headline", "value": headline},
+        ]
         response = requests.patch(url, headers=headers, json=body, timeout=TIMEOUT)
-        return response_json(response, f"Snapchat PATCH creative {creative_id}")
+        label = f"Snapchat guarded PATCH creative {creative_id}"
+        payload = response_json(response, label)
+        entities = self.checked_entities(payload, "creatives", "creative", label)
+        if (
+            len(entities) != 1
+            or entities[0]["id"] != creative_id
+            or entities[0].get("headline") != headline
+        ):
+            raise BotError("Snapchat did not confirm the requested headline edit; stopping")
+        return payload
 
 
 def verify_scope(
@@ -709,6 +754,112 @@ def creative_stays_inside_selected_squads(
     return not linked_squads or linked_squads.issubset(selected_ad_squad_ids)
 
 
+def remember_approval(state: dict[str, Any], creative_id: str, evidence: str) -> None:
+    record = state["creatives"].setdefault(creative_id, {})
+    record["awaiting_review"] = False
+    record["last_review_outcome"] = "APPROVED"
+    record["last_review_completed_at"] = utc_now()
+    record["last_review_completion_evidence"] = evidence
+
+
+def recheck_before_edit(
+    snap: SnapClient,
+    ad_account_id: str,
+    selected_ad_squad_ids: set[str],
+    state: dict[str, Any],
+    candidate: dict[str, Any],
+) -> str | None:
+    """Return the exact current headline only after fresh reads confirm eligibility.
+
+    A Creative can be shared by multiple Ads. Refresh the complete account list
+    to discover new links, then re-read each linked Ad and finally the Creative.
+    These separate reads cannot form an atomic transaction with the later PATCH;
+    the PATCH adds server-side conditions on the Creative itself.
+    """
+    creative_id = candidate["creative_id"]
+    record = state["creatives"].setdefault(creative_id, {})
+    if record.get("last_review_outcome") == "APPROVED":
+        print(f"SKIP {creative_id}: approval was previously observed; permanently protected.")
+        return None
+    if record.get("patch_in_flight") or record.get("awaiting_review"):
+        print(f"WAIT {creative_id}: a previous edit still needs a confirmed review result.")
+        return None
+
+    account_ads = snap.get_all(
+        f"/adaccounts/{ad_account_id}/ads?limit=1000&read_deleted_entities=true",
+        "ads", "ad",
+    )
+    linked_ads = []
+    for ad in account_ads:
+        if not isinstance(ad.get("deleted", False), bool):
+            raise BotError("Safety check failed: an Ad has an unknown deletion state")
+        if ad.get("deleted", False):
+            continue
+        if not isinstance(ad.get("creative_id"), str) or not ad["creative_id"]:
+            raise BotError("Safety check failed: an Ad's Creative link could not be verified")
+        if ad["creative_id"] == creative_id:
+            linked_ads.append(ad)
+
+    def linked_ads_are_safe(ads: list[dict[str, Any]]) -> bool:
+        if any(ad.get("review_status") == "APPROVED" for ad in ads):
+            remember_approval(state, creative_id, "LINKED_AD_APPROVED_BEFORE_EDIT")
+            print(f"SKIP {creative_id}: a linked Ad is APPROVED; permanently protected.")
+            return False
+        if any(ad.get("review_status") != "REJECTED" for ad in ads):
+            print(f"WAIT {creative_id}: a linked Ad is pending or not confirmed REJECTED.")
+            return False
+        if any(ad.get("ad_squad_id") not in selected_ad_squad_ids for ad in ads):
+            print(f"SKIP {creative_id}: a linked Ad is outside the selected Ad Squads.")
+            return False
+        return True
+
+    if not linked_ads_are_safe(linked_ads):
+        return None
+    if not linked_ads or candidate.get("ad_id") not in {ad["id"] for ad in linked_ads}:
+        print(f"SKIP {creative_id}: the original Ad-to-Creative link is no longer confirmed.")
+        return None
+    for ad in linked_ads:
+        fresh_ad = snap.one(
+            f"/ads/{ad['id']}?read_deleted_entities=true", "ads", "ad",
+            "Recheck linked Ad before edit",
+        )
+        if (
+            fresh_ad.get("id") != ad["id"]
+            or fresh_ad.get("creative_id") != creative_id
+            or fresh_ad.get("deleted", False) is not False
+        ):
+            print(f"SKIP {creative_id}: a linked Ad changed during the safety check.")
+            return None
+        if not linked_ads_are_safe([fresh_ad]):
+            return None
+
+    creative = snap.one(
+        f"/creatives/{creative_id}", "creatives", "creative",
+        "Recheck Creative before edit",
+    )
+    if (
+        creative.get("id") != creative_id
+        or creative.get("ad_account_id") != ad_account_id
+        or creative.get("deleted", False) is not False
+    ):
+        raise BotError("Safety check failed: the current Creative's identity could not be verified")
+    if creative.get("review_status") == "APPROVED":
+        remember_approval(state, creative_id, "CREATIVE_APPROVED_BEFORE_EDIT")
+        print(f"SKIP {creative_id}: the Creative is APPROVED; permanently protected.")
+        return None
+    if creative.get("review_status") != "DISAPPROVED":
+        print(f"WAIT {creative_id}: the Creative is pending or not confirmed DISAPPROVED.")
+        return None
+    current_headline = creative.get("headline")
+    if (
+        not isinstance(current_headline, str)
+        or clean_headline(current_headline) != candidate.get("current_headline")
+    ):
+        print(f"SKIP {creative_id}: the headline changed after candidate selection.")
+        return None
+    return current_headline
+
+
 def collect_candidates(
     ad_squad_id: str,
     selected_ad_squad_ids: set[str],
@@ -736,6 +887,8 @@ def collect_candidates(
     state_creatives = state["creatives"]
     for ad in live_ads:
         creative_id = str(ad.get("creative_id") or "")
+        if creative_id and ad.get("review_status") == "APPROVED":
+            remember_approval(state, creative_id, "LINKED_AD_APPROVED")
         record = state_creatives.get(creative_id)
         if not isinstance(record, dict):
             continue
@@ -780,18 +933,18 @@ def collect_candidates(
             continue
         globally_seen.add(creative_id)
 
-        linked_selected_ads = [
+        linked_live_ads = [
             linked_ad
             for linked_ad in all_account_ads
             if linked_ad.get("creative_id") == creative_id
             and not linked_ad.get("deleted", False)
-            and str(linked_ad.get("ad_squad_id") or "") in selected_ad_squad_ids
         ]
         linked_statuses = {
             str(linked_ad.get("review_status", "")).upper() or "UNKNOWN"
-            for linked_ad in linked_selected_ads
+            for linked_ad in linked_live_ads
         }
         if "APPROVED" in linked_statuses:
+            remember_approval(state, creative_id, "LINKED_AD_APPROVED")
             print(
                 f"SKIP {creative_id}: this Creative is connected to an APPROVED Ad; "
                 "the approved headline will not be touched."
@@ -882,10 +1035,7 @@ def collect_candidates(
             print(f"WAIT {creative_id}: creative is still PENDING_REVIEW.")
             continue
         if creative_status == "APPROVED":
-            record["awaiting_review"] = False
-            record["last_review_outcome"] = "APPROVED"
-            record["last_review_completed_at"] = utc_now()
-            record["last_review_completion_evidence"] = "CREATIVE_APPROVED"
+            remember_approval(state, creative_id, "CREATIVE_APPROVED")
             print(
                 f"SKIP {creative_id}: the Creative is APPROVED; its headline will "
                 "never be edited."
@@ -1229,17 +1379,6 @@ def record_update(
     record.pop("patch_started_at", None)
 
 
-def clear_update_reservation(state: dict[str, Any], creative_id: str) -> None:
-    record = state["creatives"].get(creative_id)
-    if not isinstance(record, dict):
-        return
-    record.pop("patch_in_flight", None)
-    record.pop("planned_headline", None)
-    record.pop("planned_previous_headline", None)
-    record.pop("patch_started_at", None)
-    record["awaiting_review"] = False
-
-
 def main() -> int:
     run_mode = env("RUN_MODE", "test").lower()
     dry_run = run_mode != "live"
@@ -1415,19 +1554,23 @@ def main() -> int:
             "after two generation rounds."
         )
 
-    if dry_run:
-        for candidate, headline in accepted:
+    print("Safety protection enabled: fresh linked-Ad checks and conditional Creative PATCH.")
+    updates_succeeded = 0
+    for candidate, headline in accepted:
+        expected_headline = recheck_before_edit(
+            snap, ad_account_id, selected_set, state, candidate
+        )
+        if expected_headline is None:
+            if not dry_run:
+                save_state(state)
+            continue
+        if dry_run:
             print(
                 f"WOULD UPDATE squad={candidate.get('ad_squad_id')} "
                 f"creative={candidate['creative_id']} "
                 f"from={candidate.get('current_headline')!r} to={headline!r}"
             )
-        print("Test mode finished. Snapchat was not changed.")
-        print(f"MONITOR_COMPLETE={'true' if all_selected_complete else 'false'}")
-        return 0
-
-    updates_succeeded = 0
-    for candidate, headline in accepted:
+            continue
         creative_id = candidate["creative_id"]
         reservation_started_at = utc_now()
         record = state["creatives"].setdefault(creative_id, {})
@@ -1439,15 +1582,9 @@ def main() -> int:
         record["awaiting_review"] = True
         record["last_review_outcome"] = "PENDING_REVIEW"
         save_state(state)
-        result = snap.patch_headline(ad_account_id, creative_id, headline)
-        wrappers = result.get("creatives", [])
-        if wrappers and isinstance(wrappers[0], dict):
-            sub_status = str(wrappers[0].get("sub_request_status", "SUCCESS")).upper()
-            if sub_status != "SUCCESS":
-                print(f"FAILED {creative_id}: Snapchat sub-request status={sub_status}")
-                clear_update_reservation(state, creative_id)
-                save_state(state)
-                continue
+        result = snap.patch_headline(
+            ad_account_id, creative_id, headline, expected_headline=expected_headline
+        )
         record_update(state, candidate, headline, result)
         save_state(state)
         updates_succeeded += 1
@@ -1456,7 +1593,10 @@ def main() -> int:
             f"{headline!r}; submitted for re-review."
         )
 
-    print(f"Live run finished: {updates_succeeded} creative(s) updated.")
+    if dry_run:
+        print("Test mode finished. Snapchat was not changed.")
+    else:
+        print(f"Live run finished: {updates_succeeded} creative(s) updated.")
     print(f"MONITOR_COMPLETE={'true' if all_selected_complete else 'false'}")
     return 0
 
