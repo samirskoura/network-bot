@@ -29,12 +29,12 @@ import tempfile
 import time
 import unicodedata
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, urljoin, urlparse
 from uuid import UUID, uuid4
 
 import requests
@@ -99,11 +99,11 @@ OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 STATE_PATH = Path(__file__).with_name("state.json")
 HEADLINE_POOL_PATH = Path(__file__).with_name("headline_pool.txt")
 STATE_VERSION = 11
-BOT_VERSION = "2026.09.13-random-per-workflow-run"
+BOT_VERSION = "2026.10.15-selected-squads"
 HEADLINE_RANDOM = random.SystemRandom()
 CHECKPOINT_SCRIPT = Path(__file__).with_name("checkpoint_encrypted_state.py")
 STATE_STOP_EXIT_CODE = 90
-HARD_MAX_UPDATES_PER_RUN = 80
+HARD_MAX_UPDATES_PER_RUN = 200
 MAX_HEADLINE_REQUEST_CREATIVES = 30
 HARD_MAX_AD_SQUADS = 20
 HEADLINE_OPTIONS_PER_CREATIVE = 5
@@ -807,6 +807,10 @@ def refresh_snap_access_token(client_id: str, client_secret: str, refresh_token:
 class SnapClient:
     def __init__(self, access_token: str) -> None:
         self.headers = {"Authorization": f"Bearer {access_token}"}
+        self._link_account_id: str | None = None
+        self._ad_link_index: dict[str, dict[str, Any]] | None = None
+        self._link_watermark: datetime | None = None
+        self._incremental_links = True
 
     def get(self, path_or_url: str, label: str) -> dict[str, Any]:
         url = path_or_url if path_or_url.startswith("http") else f"{SNAP_API}{path_or_url}"
@@ -905,6 +909,158 @@ class SnapClient:
             raise BotError(f"{label} did not return exactly one {entity_key}")
         return entities[0]
 
+    def selected_creatives(
+        self, ad_account_id: str, creative_ids: set[str]
+    ) -> list[dict[str, Any]]:
+        """Read only Creative IDs linked to the selected Squads, not the account library."""
+        creatives: list[dict[str, Any]] = []
+        ordered_ids = sorted(creative_ids)
+        for start in range(0, len(ordered_ids), 2000):
+            requested = set(ordered_ids[start:start + 2000])
+            response = requests.post(
+                f"{SNAP_API}/adaccounts/{ad_account_id}/get_creatives_by_ids",
+                headers={**self.headers, "Content-Type": "application/json"},
+                json={"entity_ids": [{"id": value} for value in sorted(requested)]},
+                timeout=TIMEOUT,
+            )
+            label = "Snapchat selected Creative lookup"
+            payload = response_json(response, label)
+            batch = self.checked_entities(payload, "creatives", "creative", label)
+            returned = [creative["id"] for creative in batch]
+            if len(returned) != len(set(returned)) or set(returned) != requested:
+                raise BotError("Safety check failed: Snapchat did not return exactly the requested Creatives")
+            if any(creative.get("ad_account_id") != ad_account_id for creative in batch):
+                raise BotError("Safety check failed: a selected Creative belongs to another Ad Account")
+            creatives.extend(batch)
+        return creatives
+
+    @staticmethod
+    def _link_timestamp(ad: dict[str, Any]) -> datetime | None:
+        value = ad.get("updated_at")
+        if not isinstance(value, str):
+            return None
+        try:
+            stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return stamp.astimezone(timezone.utc) if stamp.tzinfo is not None else None
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _validate_ad_link(ad: dict[str, Any]) -> None:
+        if not isinstance(ad.get("deleted", False), bool):
+            raise BotError("Safety check failed: an Ad has an unknown deletion state")
+        if ad.get("deleted", False):
+            return
+        if (
+            not isinstance(ad.get("creative_id"), str)
+            or not ad["creative_id"]
+            or not isinstance(ad.get("ad_squad_id"), str)
+            or not ad["ad_squad_id"]
+        ):
+            raise BotError("Safety check failed: an Ad's Creative/Squad link could not be verified")
+
+    def _full_link_audit(self, ad_account_id: str) -> None:
+        ads = self.get_all(
+            f"/adaccounts/{ad_account_id}/ads?limit=1000&read_deleted_entities=true",
+            "ads", "ad",
+        )
+        for ad in ads:
+            self._validate_ad_link(ad)
+        timestamps = [self._link_timestamp(ad) for ad in ads]
+        self._link_account_id = ad_account_id
+        self._ad_link_index = {ad["id"]: dict(ad) for ad in ads}
+        self._link_watermark = (
+            max(timestamps) if timestamps and all(value is not None for value in timestamps) else None
+        )
+        if self._link_watermark is None:
+            self._incremental_links = False
+        print(
+            "Shared-Creative link audit complete; "
+            f"{len(ads)} account Ad links checked. "
+            + ("Following edits use changed-link pages."
+               if self._incremental_links else "Full link checks retained because update timestamps are unavailable.")
+        )
+
+    def _refresh_link_changes(self, ad_account_id: str) -> None:
+        """Discover new/shared links with ordered change pages before each edit.
+
+        Known linked Ads are still read individually immediately before PATCH.
+        The audit watermark stays fixed for the entire check, with a five-minute
+        overlap, so a long batch cannot age out a new link. Missing or
+        unordered timestamps fall back to the original complete link audit.
+        Deleted cached links are retained conservatively until the next full
+        audit, so an unobserved deletion can only block an edit.
+        """
+        if self._link_watermark is None or not self._incremental_links:
+            self._full_link_audit(ad_account_id)
+            return
+        cutoff = self._link_watermark - timedelta(minutes=5)
+        path = f"/adaccounts/{ad_account_id}/ads"
+        url = f"{SNAP_API}{path}?limit=100&sort=updated_at-desc"
+        seen_urls: set[str] = set()
+        seen_ids: set[str] = set()
+        updates: dict[str, dict[str, Any]] = {}
+        previous: datetime | None = None
+        while url:
+            parsed = urlparse(url)
+            if (
+                url in seen_urls or parsed.scheme != "https"
+                or parsed.netloc != "adsapi.snapchat.com"
+                or parsed.path != f"/v1{path}"
+            ):
+                raise BotError("Safety check failed: invalid shared-link pagination")
+            if parse_qs(parsed.query).get("sort") != ["updated_at-desc"]:
+                self._incremental_links = False
+                self._full_link_audit(ad_account_id)
+                return
+            seen_urls.add(url)
+            payload = self.get(url, "Snapchat changed Ad links")
+            page = self.checked_entities(payload, "ads", "ad", "Snapchat changed Ad links")
+            stamps: list[datetime] = []
+            for ad in page:
+                self._validate_ad_link(ad)
+                if ad["id"] in seen_ids:
+                    raise BotError("Safety check failed: duplicate Ad in shared-link pagination")
+                seen_ids.add(ad["id"])
+                stamp = self._link_timestamp(ad)
+                if stamp is None or (previous is not None and stamp > previous):
+                    self._incremental_links = False
+                    self._full_link_audit(ad_account_id)
+                    return
+                stamps.append(stamp)
+                previous = stamp
+            paging = payload.get("paging")
+            if paging is None:
+                paging = {}
+            if not isinstance(paging, dict):
+                raise BotError("Safety check failed: invalid shared-link paging information")
+            next_link = paging.get("next_link")
+            if next_link is not None and not isinstance(next_link, str):
+                raise BotError("Safety check failed: invalid shared-link next-page link")
+            if not page:
+                # An unexpected empty change page cannot certify the link set.
+                self._full_link_audit(ad_account_id)
+                return
+            for ad, stamp in zip(page, stamps):
+                if stamp >= cutoff:
+                    updates[ad["id"]] = dict(ad)
+            if stamps[-1] < cutoff:
+                break
+            url = urljoin(url, next_link) if next_link else ""
+        assert self._ad_link_index is not None
+        self._ad_link_index.update(updates)
+
+    def linked_ads(self, ad_account_id: str, creative_id: str) -> list[dict[str, Any]]:
+        if self._ad_link_index is None or self._link_account_id != ad_account_id:
+            self._full_link_audit(ad_account_id)
+        else:
+            self._refresh_link_changes(ad_account_id)
+        assert self._ad_link_index is not None
+        return [
+            ad for ad in self._ad_link_index.values()
+            if not ad.get("deleted", False) and ad["creative_id"] == creative_id
+        ]
+
     def patch_headline(
         self, ad_account_id: str, creative_id: str, headline: str, *, expected_headline: str
     ) -> dict[str, Any]:
@@ -997,7 +1153,7 @@ def recheck_before_edit(
 ) -> str | None:
     """Return the exact current headline only after fresh reads confirm eligibility.
 
-    A Creative can be shared by multiple Ads. Refresh the complete account list
+    A Creative can be shared by multiple Ads. Refresh the shared-link index
     to discover new links, then re-read each linked Ad and finally the Creative.
     These separate reads cannot form an atomic transaction with the later PATCH;
     the PATCH adds server-side conditions on the Creative itself.
@@ -1017,20 +1173,7 @@ def recheck_before_edit(
         print(f"WAIT {creative_id}: a previous edit still needs a confirmed review result.")
         return None
 
-    account_ads = snap.get_all(
-        f"/adaccounts/{ad_account_id}/ads?limit=1000&read_deleted_entities=true",
-        "ads", "ad",
-    )
-    linked_ads = []
-    for ad in account_ads:
-        if not isinstance(ad.get("deleted", False), bool):
-            raise BotError("Safety check failed: an Ad has an unknown deletion state")
-        if ad.get("deleted", False):
-            continue
-        if not isinstance(ad.get("creative_id"), str) or not ad["creative_id"]:
-            raise BotError("Safety check failed: an Ad's Creative link could not be verified")
-        if ad["creative_id"] == creative_id:
-            linked_ads.append(ad)
+    linked_ads = snap.linked_ads(ad_account_id, creative_id)
 
     def linked_ads_are_safe(ads: list[dict[str, Any]]) -> bool:
         if any(ad.get("review_status") == "APPROVED" for ad in ads):
@@ -1045,7 +1188,14 @@ def recheck_before_edit(
             return False
         return True
 
-    if not linked_ads_are_safe(linked_ads):
+    # The index discovers links, not current review outcomes. A recorded
+    # approval stays protected, while other statuses are freshly fetched below.
+    if any(ad.get("review_status") == "APPROVED" for ad in linked_ads):
+        remember_approval(state, creative_id, "LINKED_AD_APPROVED_IN_LINK_AUDIT")
+        print(f"SKIP {creative_id}: an APPROVED linked Ad was observed; permanently protected.")
+        return None
+    if any(ad.get("ad_squad_id") not in selected_ad_squad_ids for ad in linked_ads):
+        print(f"SKIP {creative_id}: a linked Ad is outside the selected Ad Squads.")
         return None
     if not linked_ads or candidate.get("ad_id") not in {ad["id"] for ad in linked_ads}:
         print(f"SKIP {creative_id}: the original Ad-to-Creative link is no longer confirmed.")
@@ -1774,15 +1924,18 @@ def main() -> int:
             snap, ad_account_id, ad_squad_id
         )
 
-    all_account_ads = snap.get_all(
-        f"/adaccounts/{ad_account_id}/ads?limit=1000&read_deleted_entities=true",
-        "ads",
-        "ad",
-    )
-    account_creatives = snap.get_all(
-        f"/adaccounts/{ad_account_id}/creatives?limit=1000",
-        "creatives",
-        "creative",
+    all_account_ads: list[dict[str, Any]] = []
+    seen_ad_ids: set[str] = set()
+    for ad_squad_id in ad_squad_ids:
+        squad_ads = snap.get_all(f"/adsquads/{ad_squad_id}/ads?limit=1000", "ads", "ad")
+        for ad in squad_ads:
+            snap._validate_ad_link(ad)
+            if ad["ad_squad_id"] != ad_squad_id or ad["id"] in seen_ad_ids:
+                raise BotError("Safety check failed: selected-Squad response escaped its scope or duplicated an Ad")
+            seen_ad_ids.add(ad["id"])
+        all_account_ads.extend(squad_ads)
+    account_creatives = snap.selected_creatives(
+        ad_account_id, {ad["creative_id"] for ad in all_account_ads if not ad.get("deleted", False)}
     )
     creative_by_id = {
         str(creative.get("id")): creative
@@ -1796,8 +1949,8 @@ def main() -> int:
         for creative in account_creatives
     )
     print(
-        f"Fetched {len(all_account_ads)} account Ad(s) and "
-        f"{len(account_creatives)} Creative(s). Creative review statuses: "
+        f"Fetched {len(all_account_ads)} selected-Squad Ad(s) and "
+        f"{len(account_creatives)} linked Creative(s). Creative review statuses: "
         + ", ".join(
             f"{status}={count}"
             for status, count in sorted(creative_status_counts.items())
